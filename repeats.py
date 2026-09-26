@@ -7,6 +7,12 @@
 - 反复段允许嵌套
 - 行末可附时间标记：[拍数] 或 [拍数@BPM]；拍数省略时默认为 4，
   未标速度的小节沿用上一演奏小节的速度，初始速度 120 BPM
+
+临时变速方案（可选，逐行）：
+    演奏序号=BPM
+- 演奏序号按反复展开后的实际轮次计数（从 1 开始），BPM 为正整数
+- 演奏到该轮次时临时速度优先于该小节原谱速度，并继续传给后续未标速小节；
+  遇到下一处原谱显式速度或下一条临时变速时重新切换
 """
 
 import math
@@ -58,6 +64,71 @@ def parse_timing(content):
             return None, None, f"BPM 必须为正整数，得到 “{bpm_s}”"
         bpm = int(bpm_s)
     return int(beats_s), bpm, None
+
+
+def parse_tempo_map(text, total=None):
+    """解析临时变速方案文本，返回 ({演奏序号: BPM}, errors)。
+
+    每行格式为 “演奏序号=BPM”（空行忽略）：
+    - 演奏序号按反复展开后的实际轮次计数，必须为正整数；
+      提供 total（展开后的总小节数）时，序号不得超出该范围
+    - BPM 必须为正整数
+    - 序号重复时报错并指出首次出现的行
+
+    errors 条目为 {"line": 方案内行号, "source": "临时变速", "message": 错误描述}，
+    按行号排序。
+    """
+    entries = {}
+    seen = {}  # 演奏序号 -> 首次出现的方案行号（含因超范围被拒的序号）
+    errors = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 跳过空行
+
+        parts = line.split("=")
+        if len(parts) != 2:
+            errors.append({
+                "line": lineno,
+                "source": "临时变速",
+                "message": "格式错误：应为 演奏序号=BPM，例如 “11=90”",
+            })
+            continue
+        seq_s, bpm_s = parts[0].strip(), parts[1].strip()
+        if not POSITIVE_INT_RE.fullmatch(seq_s) or int(seq_s) == 0:
+            errors.append({
+                "line": lineno,
+                "source": "临时变速",
+                "message": f"演奏序号必须为正整数，得到 “{seq_s}”",
+            })
+            continue
+        if not POSITIVE_INT_RE.fullmatch(bpm_s) or int(bpm_s) == 0:
+            errors.append({
+                "line": lineno,
+                "source": "临时变速",
+                "message": f"BPM 必须为正整数，得到 “{bpm_s}”",
+            })
+            continue
+
+        seq = int(seq_s)
+        if seq in seen:
+            errors.append({
+                "line": lineno,
+                "source": "临时变速",
+                "message": f"演奏序号 {seq} 重复，首次出现在第 {seen[seq]} 行",
+            })
+            continue
+        seen[seq] = lineno
+        if total is not None and seq > total:
+            errors.append({
+                "line": lineno,
+                "source": "临时变速",
+                "message": f"演奏序号 {seq} 超出展开范围（共 {total} 小节）",
+            })
+            continue
+        entries[seq] = int(bpm_s)
+
+    return entries, errors
 
 
 def _round_ms(value):
@@ -166,8 +237,30 @@ def _iter_measures(root):
             stack.append([node["children"], 0, node["count"]])
 
 
-def expand(root, limit=MAX_MEASURES):
+def _iter_playback(root, tempo_map=None):
+    """按实际演奏顺序产生 (小节节点, 演奏序号, 当前 BPM)。
+
+    展开与拍点查询共用同一速度轨迹，切换规则：
+    - 初始速度 120 BPM
+    - 演奏到临时变速指定的轮次时，临时速度优先于该小节原谱速度
+    - 否则遇到带原谱速度标记的小节时切换为原谱速度
+    - 未标速度的小节沿用上一演奏小节的速度
+    """
+    bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
+    seq = 0  # 演奏序号
+    for node in _iter_measures(root):
+        seq += 1
+        if tempo_map is not None and seq in tempo_map:
+            bpm = tempo_map[seq]  # 临时变速优先于原谱速度
+        elif node["bpm"] is not None:
+            bpm = node["bpm"]
+        yield node, seq, bpm
+
+
+def expand(root, limit=MAX_MEASURES, tempo_map=None):
     """按嵌套层级展开为实际演奏顺序。
+
+    tempo_map 为可选的临时变速方案 {演奏序号: BPM}，速度轨迹见 _iter_playback。
 
     返回 (rows, overflow)：
     - rows     为 [{"seq": 演奏序号, "num": 原小节编号, "line": 源行号,
@@ -176,15 +269,11 @@ def expand(root, limit=MAX_MEASURES):
     - overflow 为导致超过 limit 的小节节点；未超限时为 None
     """
     rows = []
-    bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
     elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
-    for node in _iter_measures(root):
-        # 带速度标记的小节每次演奏到时先切换速度；未标速度则沿用当前速度
-        if node["bpm"] is not None:
-            bpm = node["bpm"]
+    for node, seq, bpm in _iter_playback(root, tempo_map):
         duration = node["beats"] * 60000 / bpm
         rows.append({
-            "seq": len(rows) + 1,
+            "seq": seq,
             "num": node["num"],
             "line": node["line"],
             "start_ms": _round_ms(elapsed),
@@ -197,9 +286,11 @@ def expand(root, limit=MAX_MEASURES):
 
 
 def beats_in_window(root, start_ms, end_ms,
-                    measure_limit=MAX_MEASURES, beat_limit=MAX_BEATS):
+                    measure_limit=MAX_MEASURES, beat_limit=MAX_BEATS,
+                    tempo_map=None):
     """列出时间窗 [start_ms, end_ms) 内的拍点（左闭右开）。
 
+    tempo_map 为可选的临时变速方案 {演奏序号: BPM}，与展开共用同一速度轨迹。
     落窗判断使用未取整的累计时间，展示毫秒按 _round_ms 规则取整；
     整小节在窗外时按小节跨度直接跳过，窗内拍点超过 beat_limit 时停止，
     以免大量反复或长小节耗尽服务资源。
@@ -211,13 +302,8 @@ def beats_in_window(root, start_ms, end_ms,
                             "node": 导致停止的小节节点}
     """
     beats = []
-    bpm = INITIAL_BPM  # 当前速度；反复回跳后未标速度的小节沿用上一实际演奏小节
     elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
-    seq = 0  # 演奏序号
-    for node in _iter_measures(root):
-        if node["bpm"] is not None:
-            bpm = node["bpm"]
-        seq += 1
+    for node, seq, bpm in _iter_playback(root, tempo_map):
         beat_len = 60000 / bpm  # 每拍时长（毫秒）
         duration = node["beats"] * beat_len
         if elapsed >= end_ms:

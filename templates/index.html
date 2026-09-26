@@ -70,6 +70,14 @@
   </p>
   <textarea id="input" rows="12" spellcheck="false"
     placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
+  <p class="hint">
+    临时变速（可选）：每行一条 <code>演奏序号=BPM</code>，展开与拍点查询共用。
+    演奏序号按反复展开后的实际轮次计数，BPM 为正整数；演奏到该轮次时临时速度优先于
+    该小节原谱速度，并沿用至后续未标速小节，遇到下一处原谱显式速度或下一条临时变速时重新切换。
+    序号重复、超出展开范围或格式错误时会指出方案内的行号。
+  </p>
+  <textarea id="tempo" rows="3" spellcheck="false"
+    placeholder="例如：&#10;11=90&#10;16=120"></textarea>
   <div class="toolbar">
     <button id="expandBtn" class="primary">展开</button>
     <button id="exampleBtn">填入示例</button>
@@ -110,7 +118,12 @@ const $ = (id) => document.getElementById(id);
 let lastRows = [];
 
 $("expandBtn").addEventListener("click", doExpand);
-$("clearBtn").addEventListener("click", () => { $("input").value = ""; reset(); $("input").focus(); });
+$("clearBtn").addEventListener("click", () => {
+  $("input").value = "";
+  $("tempo").value = "";
+  reset();
+  $("input").focus();
+});
 $("exampleBtn").addEventListener("click", () => {
   $("input").value = ["1[4@120]", "2", "|:3", "4[2]", "|:5", "6:|x3", "7:|x2[4@90]", "8"].join("\n");
   doExpand();
@@ -148,7 +161,7 @@ async function doExpand() {
     const resp = await fetch("/api/expand", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: $("input").value }),
+      body: JSON.stringify({ input: $("input").value, tempo: $("tempo").value }),
     });
     data = await resp.json();
   } catch (e) {
@@ -182,7 +195,9 @@ function showErrors(errors) {
   const ul = document.createElement("ul");
   for (const e of errors) {
     const li = document.createElement("li");
-    li.textContent = e.line ? `第 ${e.line} 行：${e.message}` : e.message;
+    // 带 source 的错误（如临时变速方案）行号指对应输入区内的行号
+    const where = e.line ? `${e.source ? e.source : ""}第 ${e.line} 行` : (e.source || "");
+    li.textContent = where ? `${where}：${e.message}` : e.message;
     ul.appendChild(li);
   }
   $("errors").appendChild(ul);
@@ -205,6 +220,7 @@ async function doBeatQuery() {
         input: $("input").value,
         start_ms: toNum("startMs"),
         end_ms: toNum("endMs"),
+        tempo: $("tempo").value,
       }),
     });
     data = await resp.json();

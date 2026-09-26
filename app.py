@@ -5,7 +5,9 @@ import os
 
 from flask import Flask, jsonify, render_template, request
 
-from repeats import MAX_BEATS, MAX_MEASURES, beats_in_window, expand, parse
+from repeats import (
+    MAX_BEATS, MAX_MEASURES, beats_in_window, expand, parse, parse_tempo_map,
+)
 
 app = Flask(__name__)
 
@@ -48,6 +50,31 @@ def _parse_window(data):
     return start_ms, end_ms, None
 
 
+def _has_tempo(data):
+    """请求是否提供了需要校验的临时变速方案（非空文本或非法类型）。"""
+    tempo = data.get("tempo")
+    return tempo is not None and (not isinstance(tempo, str) or bool(tempo.strip()))
+
+
+def _parse_tempo(data, total):
+    """从请求数据解析临时变速方案，返回 (tempo_map, errors)。
+
+    total 为展开后的总小节数，用于校验序号范围；
+    未提供方案时 tempo_map 为 None 且 errors 为空。
+    """
+    tempo_text = data.get("tempo")
+    if tempo_text is None:
+        return None, []
+    if not isinstance(tempo_text, str):
+        return None, [{"line": None, "message": "临时变速方案必须是多行文本"}]
+    if not tempo_text.strip():
+        return None, []
+    tempo_map, errors = parse_tempo_map(tempo_text, total)
+    if errors:
+        return None, errors
+    return tempo_map, []
+
+
 @app.post("/api/expand")
 def api_expand():
     data = request.get_json(silent=True) or {}
@@ -70,6 +97,13 @@ def api_expand():
             "errors": [_measure_overflow_error(overflow)],
         })
 
+    # 临时变速方案的范围校验依赖展开后的总小节数
+    tempo_map, tempo_errors = _parse_tempo(data, len(rows))
+    if tempo_errors:
+        return jsonify({"ok": False, "errors": tempo_errors})
+    if tempo_map:
+        rows, _ = expand(root, tempo_map=tempo_map)
+
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
 
 
@@ -91,7 +125,22 @@ def api_beats():
     if err is not None:
         return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
 
-    beats, overflow = beats_in_window(root, start_ms, end_ms)
+    # 提供了临时变速方案时，先展开一次取得总小节数以校验序号范围；
+    # 未提供方案时不做这次展开，行为与之前完全一致
+    tempo_map = None
+    if _has_tempo(data):
+        rows, overflow = expand(root)
+        if overflow is not None:
+            return jsonify({
+                "ok": False,
+                "overflow": True,
+                "errors": [_measure_overflow_error(overflow)],
+            })
+        tempo_map, tempo_errors = _parse_tempo(data, len(rows))
+        if tempo_errors:
+            return jsonify({"ok": False, "errors": tempo_errors})
+
+    beats, overflow = beats_in_window(root, start_ms, end_ms, tempo_map=tempo_map)
     if overflow is not None:
         node = overflow["node"]
         if overflow["kind"] == "measures":
