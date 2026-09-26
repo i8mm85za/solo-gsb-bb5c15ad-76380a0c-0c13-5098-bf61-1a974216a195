@@ -68,8 +68,17 @@
     120 BPM，未标速度的小节沿用上一演奏小节的速度；起止时间单位为毫秒。
     展开结果超过 5000 小节时将停止并指出导致超限的源行。
   </p>
-  <textarea id="input" rows="12" spellcheck="false"
+  <textarea id="input" rows="10" spellcheck="false"
     placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
+  <h2>临时变速方案</h2>
+  <p class="hint">
+    可选。逐行输入 <code>演奏序号=BPM</code>（均为正整数），序号按反复展开后的实际轮次计数，
+    展开与拍点查询共用本方案。演奏到指定轮次时临时速度优先于该小节原谱速度，
+    并继续沿用到后续未标速小节，直到遇到下一处原谱显式速度或下一条临时变速。
+    重复序号、超出展开范围或格式错误都会定位到方案行号。
+  </p>
+  <textarea id="tempo" rows="4" spellcheck="false"
+    placeholder="例如（上例展开共 21 小节）：&#10;3=144&#10;12=100"></textarea>
   <div class="toolbar">
     <button id="expandBtn" class="primary">展开</button>
     <button id="exampleBtn">填入示例</button>
@@ -80,7 +89,7 @@
   <p id="summary"></p>
   <table id="result" hidden>
     <thead>
-      <tr><th>演奏序号</th><th>原小节编号</th><th>源行号</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th></tr>
+      <tr><th>演奏序号</th><th>原小节编号</th><th>源行号</th><th>速度(BPM)</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th></tr>
     </thead>
     <tbody></tbody>
   </table>
@@ -89,7 +98,8 @@
   <p class="hint">
     输入起止毫秒，列出时间窗内每一拍的时间、演奏序号、原小节编号、拍序与首拍标记。
     时间窗按左闭右开 <code>[起始, 结束)</code> 处理；落窗判断使用未取整的累计时间，
-    展示毫秒四舍五入到最近毫秒。窗内拍点超过 5000 时停止并指出对应源行。
+    展示毫秒四舍五入到最近毫秒，速度轨迹与上方展开共用同一份临时变速方案。
+    窗内拍点超过 5000 时停止并指出对应源行。
   </p>
   <div class="toolbar">
     <input id="startMs" type="number" min="0" step="any" placeholder="起始毫秒（含）">
@@ -110,7 +120,12 @@ const $ = (id) => document.getElementById(id);
 let lastRows = [];
 
 $("expandBtn").addEventListener("click", doExpand);
-$("clearBtn").addEventListener("click", () => { $("input").value = ""; reset(); $("input").focus(); });
+$("clearBtn").addEventListener("click", () => {
+  $("input").value = "";
+  $("tempo").value = "";
+  reset();
+  $("input").focus();
+});
 $("exampleBtn").addEventListener("click", () => {
   $("input").value = ["1[4@120]", "2", "|:3", "4[2]", "|:5", "6:|x3", "7:|x2[4@90]", "8"].join("\n");
   doExpand();
@@ -148,7 +163,10 @@ async function doExpand() {
     const resp = await fetch("/api/expand", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: $("input").value }),
+      body: JSON.stringify({
+        input: $("input").value,
+        tempo: $("tempo").value,
+      }),
     });
     data = await resp.json();
   } catch (e) {
@@ -166,7 +184,7 @@ async function doExpand() {
   const frag = document.createDocumentFragment();
   for (const r of data.rows) {
     const tr = document.createElement("tr");
-    for (const v of [r.seq, r.num, r.line, r.start_ms, r.end_ms]) {
+    for (const v of [r.seq, r.num, r.line, r.bpm, r.start_ms, r.end_ms]) {
       const td = document.createElement("td");
       td.textContent = v;
       tr.appendChild(td);
@@ -182,7 +200,10 @@ function showErrors(errors) {
   const ul = document.createElement("ul");
   for (const e of errors) {
     const li = document.createElement("li");
-    li.textContent = e.line ? `第 ${e.line} 行：${e.message}` : e.message;
+    const where = e.source === "tempo" ? "临时变速方案" : "乐谱输入";
+    li.textContent = e.line
+      ? `${where}第 ${e.line} 行：${e.message}`
+      : e.message;
     ul.appendChild(li);
   }
   $("errors").appendChild(ul);
@@ -203,6 +224,7 @@ async function doBeatQuery() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         input: $("input").value,
+        tempo: $("tempo").value,
         start_ms: toNum("startMs"),
         end_ms: toNum("endMs"),
       }),
@@ -236,8 +258,10 @@ async function doBeatQuery() {
 }
 
 function downloadCsv() {
-  const lines = ["演奏序号,原小节编号,源行号,起始时间(毫秒),结束时间(毫秒)"];
-  for (const r of lastRows) lines.push(`${r.seq},${r.num},${r.line},${r.start_ms},${r.end_ms}`);
+  const lines = ["演奏序号,原小节编号,源行号,速度(BPM),起始时间(毫秒),结束时间(毫秒)"];
+  for (const r of lastRows) {
+    lines.push(`${r.seq},${r.num},${r.line},${r.bpm},${r.start_ms},${r.end_ms}`);
+  }
   // 加 BOM 以便 Excel 正确识别 UTF-8 中文表头
   const blob = new Blob(["﻿" + lines.join("\r\n") + "\r\n"],
     { type: "text/csv;charset=utf-8" });

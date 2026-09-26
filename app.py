@@ -5,7 +5,15 @@ import os
 
 from flask import Flask, jsonify, render_template, request
 
-from repeats import MAX_BEATS, MAX_MEASURES, beats_in_window, expand, parse
+from repeats import (
+    MAX_BEATS,
+    MAX_MEASURES,
+    beats_in_window,
+    expand,
+    parse,
+    parse_tempo_plan,
+    tempo_range_errors,
+)
 
 app = Flask(__name__)
 
@@ -24,6 +32,33 @@ def _measure_overflow_error(node):
             f"在第 {node['line']} 行（小节 {node['num']}）处停止"
         ),
     }
+
+
+def _prepare(data):
+    """解析乐谱与临时变速方案并完成结构校验。
+
+    返回 (root, tempo_plan, errors)：校验失败时 root 为 None。
+    """
+    text = data.get("input", "")
+    if not isinstance(text, str) or not text.strip():
+        return None, None, [{"line": None, "message": "输入为空，请逐行输入小节编号"}]
+
+    root, errors = parse(text)
+
+    tempo_text = data.get("tempo", "")
+    if tempo_text is None:
+        tempo_text = ""
+    tempo_plan = {}
+    if not isinstance(tempo_text, str):
+        errors.append({"line": None, "source": "tempo",
+                       "message": "临时变速方案必须是文本（逐行 演奏序号=BPM）"})
+    else:
+        tempo_plan, tempo_errors = parse_tempo_plan(tempo_text)
+        errors.extend(tempo_errors)
+
+    if errors:
+        return None, None, errors
+    return root, tempo_plan, None
 
 
 def _parse_window(data):
@@ -51,18 +86,11 @@ def _parse_window(data):
 @app.post("/api/expand")
 def api_expand():
     data = request.get_json(silent=True) or {}
-    text = data.get("input", "")
-    if not isinstance(text, str) or not text.strip():
-        return jsonify({
-            "ok": False,
-            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
-        })
-
-    root, errors = parse(text)
-    if errors:
+    root, tempo_plan, errors = _prepare(data)
+    if errors is not None:
         return jsonify({"ok": False, "errors": errors})
 
-    rows, overflow = expand(root)
+    rows, overflow = expand(root, tempo_plan)
     if overflow is not None:
         return jsonify({
             "ok": False,
@@ -70,28 +98,37 @@ def api_expand():
             "errors": [_measure_overflow_error(overflow)],
         })
 
+    range_errors = tempo_range_errors(tempo_plan, len(rows))
+    if range_errors:
+        return jsonify({"ok": False, "errors": range_errors})
+
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
 
 
 @app.post("/api/beats")
 def api_beats():
     data = request.get_json(silent=True) or {}
-    text = data.get("input", "")
-    if not isinstance(text, str) or not text.strip():
-        return jsonify({
-            "ok": False,
-            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
-        })
-
-    root, errors = parse(text)
-    if errors:
+    root, tempo_plan, errors = _prepare(data)
+    if errors is not None:
         return jsonify({"ok": False, "errors": errors})
 
     start_ms, end_ms, err = _parse_window(data)
     if err is not None:
         return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
 
-    beats, overflow = beats_in_window(root, start_ms, end_ms)
+    # 先完整展开以校验临时变速序号的范围，并共用同一速度轨迹
+    rows, overflow = expand(root, tempo_plan)
+    if overflow is not None:
+        return jsonify({
+            "ok": False,
+            "overflow": True,
+            "errors": [_measure_overflow_error(overflow)],
+        })
+    range_errors = tempo_range_errors(tempo_plan, len(rows))
+    if range_errors:
+        return jsonify({"ok": False, "errors": range_errors})
+
+    beats, overflow = beats_in_window(root, start_ms, end_ms, tempo_plan)
     if overflow is not None:
         node = overflow["node"]
         if overflow["kind"] == "measures":
